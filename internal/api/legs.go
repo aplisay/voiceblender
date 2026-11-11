@@ -303,6 +303,10 @@ func inviteFailureReason(err error, hasRingTimeout bool, ctx context.Context) st
 		}
 	}
 
+	if errors.Is(err, sipmod.ErrSRTPRefused) {
+		return "not_acceptable"
+	}
+
 	return "invite_failed"
 }
 
@@ -764,49 +768,62 @@ func (s *Server) setupLegEventForwarding(l *leg.SIPLeg) {
 // A SIPREC re-INVITE may also carry an updated recording metadata document,
 // with or without SDP. The SDP is applied first so any newly negotiated stream
 // exists and carries its a=label before the metadata is joined to it.
-func (s *Server) HandleReInvite(callID string, body *sipmod.MessageBody) []byte {
+//
+// A non-nil error refuses the offer with 488 and changes nothing on the leg.
+func (s *Server) HandleReInvite(callID string, body *sipmod.MessageBody) ([]byte, error) {
 	sl := s.LegMgr.FindSIPByCallID(callID)
 	if sl == nil {
 		s.Log.Warn("re-INVITE: no matching leg", "call_id", callID)
-		return nil
+		return nil, nil
+	}
+
+	offer, hasOffer := body.SDP()
+	if hasOffer && sl.RefusesOffer(offer) {
+		return nil, sipmod.ErrOfferRefused
 	}
 
 	// Reset session timer on any in-dialog re-INVITE (RFC 4028 §10).
 	sl.ResetSessionTimer()
 
 	var answer []byte
-	if offer, ok := body.SDP(); ok {
+	if hasOffer {
 		direction := ""
 		answer, direction = sl.ApplyRemoteOffer(offer)
 		sl.HandleRemoteHold(direction)
 	}
 	s.applySIPRECMetadata(sl, body)
-	return answer
+	return answer, nil
 }
 
 // HandleUpdate processes a remote in-dialog UPDATE (RFC 3311). For session-
 // timer refresh (no SDP), it only resets the session timer. When an SDP
 // offer is included, it reuses the re-INVITE path to renegotiate media and
 // returns the SDP answer for the 200 OK response.
-func (s *Server) HandleUpdate(callID string, body *sipmod.MessageBody, hasSDP bool) []byte {
+//
+// A non-nil error refuses the offer with 488 and changes nothing on the leg.
+func (s *Server) HandleUpdate(callID string, body *sipmod.MessageBody, hasSDP bool) ([]byte, error) {
 	sl := s.LegMgr.FindSIPByCallID(callID)
 	if sl == nil {
 		s.Log.Warn("UPDATE: no matching leg", "call_id", callID)
-		return nil
+		return nil, nil
+	}
+
+	offer, hasOffer := body.SDP()
+	hasOffer = hasOffer && hasSDP
+	if hasOffer && sl.RefusesOffer(offer) {
+		return nil, sipmod.ErrOfferRefused
 	}
 
 	sl.ResetSessionTimer()
 
 	var answer []byte
-	if hasSDP {
-		if offer, ok := body.SDP(); ok {
-			direction := ""
-			answer, direction = sl.ApplyRemoteOffer(offer)
-			sl.HandleRemoteHold(direction)
-		}
+	if hasOffer {
+		direction := ""
+		answer, direction = sl.ApplyRemoteOffer(offer)
+		sl.HandleRemoteHold(direction)
 	}
 	s.applySIPRECMetadata(sl, body)
-	return answer
+	return answer, nil
 }
 
 func (s *Server) unholdLeg(w http.ResponseWriter, r *http.Request) {
@@ -1268,6 +1285,18 @@ func (s *Server) doCreateSIPOutboundLeg(req CreateLegRequest) (LegView, error) {
 		}
 	}
 
+	var srtpRequired bool
+	switch req.SRTP {
+	case "":
+	case "required":
+		if req.RTT {
+			return LegView{}, newAPIError(http.StatusBadRequest, "srtp cannot be combined with rtt")
+		}
+		srtpRequired = true
+	default:
+		return LegView{}, newAPIError(http.StatusBadRequest, "invalid srtp %q: the only value is \"required\"", req.SRTP)
+	}
+
 	// Reject a malformed multi-stream offer up front: letting it through would
 	// surface as a failed INVITE, which reads like a network problem.
 	if len(req.Streams) > 0 {
@@ -1352,7 +1381,7 @@ func (s *Server) doCreateSIPOutboundLeg(req CreateLegRequest) (LegView, error) {
 	}
 
 	// Build invite options.
-	inviteOpts := sipmod.InviteOptions{Codecs: codecs}
+	inviteOpts := sipmod.InviteOptions{Codecs: codecs, SRTP: srtpRequired}
 	if req.Auth != nil {
 		inviteOpts.AuthUsername = req.Auth.Username
 		inviteOpts.AuthPassword = req.Auth.Password
@@ -1510,17 +1539,17 @@ func (s *Server) HandleInboundCall(call *sipmod.InboundCall) {
 		s.handleWhatsAppInbound(call)
 		return
 	}
-	if sipmod.IsMetaFromHost(call) {
-		// A proxy that re-encrypted with SDES leaves an SRTP offer no
-		// path here can decrypt; answering it would be silent audio.
-		if call.RemoteSDP.AudioIsSRTPOnly() {
-			s.Log.Error("meta From host offers SRTP without a DTLS fingerprint; no media path can carry it",
-				"from", call.From, "to", call.To)
-			if err := s.SIPEngine.DialogRespond(call.Dialog, sip.StatusNotAcceptableHere, "Unsupported Media Transport", nil, s.SIPEngine.ServerHeader()); err != nil {
-				s.Log.Error("failed to send 488 Not Acceptable Here", "error", err)
-			}
-			return
+	// DTLS-SRTP outside the WhatsApp path, or SDES with no crypto suite we
+	// support: answering it would be silent audio.
+	if call.RemoteSDP.AudioNeedsUnusableSRTP() {
+		s.Log.Error("offer needs SRTP that no media path here can carry",
+			"from", call.From, "to", call.To)
+		if err := s.SIPEngine.DialogRespond(call.Dialog, sip.StatusNotAcceptableHere, "Unsupported Media Transport", nil, s.SIPEngine.ServerHeader()); err != nil {
+			s.Log.Error("failed to send 488 Not Acceptable Here", "error", err)
 		}
+		return
+	}
+	if sipmod.IsMetaFromHost(call) {
 		s.Log.Info("meta From host without DTLS media; taking the classic SIP path",
 			"from", call.From, "to", call.To)
 	}

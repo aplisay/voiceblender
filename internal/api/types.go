@@ -56,6 +56,7 @@ type CreateLegRequest struct {
 	SpeechDetection *bool             `json:"speech_detection,omitempty"` // override server default for speaking.started/speaking.stopped events
 	Filters         []FilterSpec      `json:"filters,omitempty"`          // ingress audio processing chain; omit for the server default, send [] for none
 	RTT             bool              `json:"rtt,omitempty"`              // offer Real-Time Text (T.140 / RFC 4103) on the outbound INVITE, or enable bidi text channel for websocket legs
+	SRTP            string            `json:"srtp,omitempty"`             // "required" offers SDES-SRTP and never falls back to plain RTP; omitted = plain RTP (sip legs only)
 
 	// CustomData is opaque application JSON echoed on the leg view and in
 	// every event published for this leg.
@@ -144,6 +145,7 @@ var createLegRequestFields = map[string]FieldEnrichment{
 	"filters":          {Description: "Ordered audio processing chain applied to audio arriving from this leg, before it reaches the room mixer and therefore before other legs, recordings and speech-to-text see it. Each entry names a built-in filter and may carry parameters. Omit the field to use the server default (AUDIO_FILTERS env var); send an empty array for no processing. Filters run in the order given, and corrective filters should precede effects. Known filters: denoise (background noise suppression), bandpass (low_hz, high_hz), gain (volume, -8 to 8 in ~3 dB steps), pitch (shifts the voice up or down in semitones; semitones, mix), robotic (metallic voice effect that keeps speech easy to follow; pitch_hz, depth, mix), vocoder (a stronger, fully synthetic robot voice that is noticeably harder to understand; carrier_hz, bands, mix). Noise suppression removes background noise, not competing speech."},
 	"custom_data":      {Description: customDataDescription},
 	"rtt":              {Description: "For sip legs: offer Real-Time Text (ITU-T T.140 over RTP per RFC 4103) alongside audio. For websocket legs: enable the bidirectional text-message channel. Default: false.", Default: false},
+	"srtp":             {Description: "SIP legs only. `required` offers the call's audio as SRTP with SDES keys (RTP/SAVP with a=crypto, RFC 4568). The call fails with reason not_acceptable when the far end refuses the offer or answers without SRTP; it never falls back to plain RTP. Omit the field for plain RTP. Cannot be combined with `rtt`. Inbound calls need no setting: an RTP/SAVP offer is answered with SRTP.", Enum: []string{"required"}},
 	"streams":          {Description: "SIP outbound only. Extra m=audio sections to offer alongside the call's primary bidirectional audio, so a multi-stream call is established by the first INVITE instead of a follow-up re-INVITE. Each entry binds its own RTP port and may be mixed into its own room. To add a stream to a call that is already up, use POST /v1/legs/{id}/streams instead."},
 	"url":              {Description: "WebSocket target URL (ws:// or wss://) for outbound websocket legs. Required when type=websocket.", Format: "uri"},
 	"sample_rate":      {Description: "PCM sample rate for websocket legs. The room's mixer automatically resamples between this and the room rate.", Enum: []string{"8000", "16000", "24000", "48000"}, Default: 16000},
@@ -404,6 +406,7 @@ type LegStreamView struct {
 	SampleRate       int    `json:"sample_rate,omitempty"`
 	LocalPort        int    `json:"local_port,omitempty"`
 	RemoteAddr       string `json:"remote_addr,omitempty"`
+	SRTP             bool   `json:"srtp,omitempty"`
 	Label            string `json:"label,omitempty"`
 	Content          string `json:"content,omitempty"`
 	Lang             string `json:"lang,omitempty"`
@@ -423,6 +426,7 @@ var legStreamViewFields = map[string]FieldEnrichment{
 	"sample_rate":       {Description: "Native sample rate of the codec the stream is running, in Hz. It follows a mid-call codec renegotiation."},
 	"local_port":        {Description: "Local RTP port. Each stream binds its own port; a shared transport is undefined without BUNDLE (RFC 9143)."},
 	"remote_addr":       {Description: "Remote RTP address media is currently sent to."},
+	"srtp":              {Description: "True when the stream's media is SRTP, keyed by SDES (RFC 4568). Omitted for plain RTP."},
 	"label":             {Description: "The stream's a=label value (RFC 4574), for correlating it with external metadata."},
 	"content":           {Description: "The stream's a=content value (RFC 4796), e.g. \"main\" for original audio and \"alt\" for a translated feed."},
 	"lang":              {Description: "The stream's a=lang value (RFC 8866): a BCP 47 language tag such as \"en\" or \"es-ES\"."},

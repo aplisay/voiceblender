@@ -31,6 +31,7 @@ type StreamInfo struct {
 	SampleRate int
 	LocalPort  int
 	RemoteAddr string
+	SRTP       bool
 	Label      string
 	Content    string
 	Lang       string
@@ -100,6 +101,7 @@ func (l *SIPLeg) streamInfoLocked(s *mediaStream) StreamInfo {
 	}
 	if s.rtpSess != nil {
 		info.LocalPort = s.rtpSess.LocalPort()
+		info.SRTP = s.rtpSess.Secure()
 		if addr := s.rtpSess.RemoteAddr(); addr != nil {
 			info.RemoteAddr = addr.String()
 		}
@@ -139,6 +141,13 @@ func (l *SIPLeg) AddStream(ctx context.Context, req StreamRequest) (StreamInfo, 
 	if err != nil {
 		return StreamInfo{}, fmt.Errorf("allocate RTP session: %w", err)
 	}
+	var crypto string
+	if l.srtpActive() {
+		if crypto, err = sess.OfferSRTP(); err != nil {
+			sess.Close()
+			return StreamInfo{}, err
+		}
+	}
 
 	direction := req.Direction
 	if direction == "" {
@@ -169,6 +178,7 @@ func (l *SIPLeg) AddStream(ctx context.Context, req StreamRequest) (StreamInfo, 
 		Label:     req.Label,
 		Content:   req.Content,
 		Lang:      req.Lang,
+		Crypto:    crypto,
 	}
 	l.streams = append(l.streams, s)
 	l.mlines.Append(sipmod.MLineSlot{
@@ -253,6 +263,7 @@ func (l *SIPLeg) ensurePrimarySlotLocked() {
 	}
 	if l.prim.rtpSess != nil {
 		local.Port = l.prim.rtpSess.LocalPort()
+		local.Crypto = l.prim.rtpSess.LocalCrypto()
 	}
 	l.mlines.Append(sipmod.MLineSlot{
 		Media: "audio", Proto: []string{"RTP", "AVP"},

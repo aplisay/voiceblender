@@ -359,16 +359,21 @@ func TestAudioStreamPayloadType(t *testing.T) {
 	}
 }
 
-func TestAudioIsSRTPOnly(t *testing.T) {
+func TestAudioNeedsUnusableSRTP(t *testing.T) {
+	const crypto = "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:WVNfX19zZW1jdGwgKCkgewkyMjA7fQp9CnVubGVz\r\n"
 	cases := []struct {
 		name string
 		sdp  string
 		want bool
 	}{
 		{"plain RTP/AVP", "m=audio 40000 RTP/AVP 0\r\n", false},
-		{"SDES SRTP", "m=audio 40000 RTP/SAVP 0\r\na=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:abcd\r\n", true},
+		{"SDES SRTP with a usable key", "m=audio 40000 RTP/SAVP 0\r\n" + crypto, false},
+		{"SDES SRTP with a bad key", "m=audio 40000 RTP/SAVP 0\r\na=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:abcd\r\n", true},
+		{"SDES SRTP with an unknown suite", "m=audio 40000 RTP/SAVP 0\r\na=crypto:1 F8_128_HMAC_SHA1_80 inline:WVNfX19zZW1jdGwgKCkgewkyMjA7fQp9CnVubGVz\r\n", true},
+		{"SDES SRTP with no crypto line", "m=audio 40000 RTP/SAVP 0\r\n", true},
 		{"DTLS-SRTP", "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n", true},
-		{"SRTP alongside plain RTP", "m=audio 40000 RTP/SAVP 0\r\nm=audio 40002 RTP/AVP 0\r\n", false},
+		{"DTLS-SRTP carrying a crypto line", "m=audio 9 UDP/TLS/RTP/SAVPF 0\r\n" + crypto, true},
+		{"unusable SRTP alongside plain RTP", "m=audio 40000 RTP/SAVP 0\r\nm=audio 40002 RTP/AVP 0\r\n", false},
 		{"plain RTP section rejected with port 0", "m=audio 40000 RTP/SAVP 0\r\nm=audio 0 RTP/AVP 0\r\n", true},
 	}
 	for _, tc := range cases {
@@ -378,17 +383,17 @@ func TestAudioIsSRTPOnly(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ParseSDP: %v", err)
 			}
-			if got := m.AudioIsSRTPOnly(); got != tc.want {
-				t.Errorf("AudioIsSRTPOnly() = %v, want %v", got, tc.want)
+			if got := m.AudioNeedsUnusableSRTP(); got != tc.want {
+				t.Errorf("AudioNeedsUnusableSRTP() = %v, want %v", got, tc.want)
 			}
 		})
 	}
-	if (*SDPMedia)(nil).AudioIsSRTPOnly() {
-		t.Error("nil SDPMedia should not report SRTP-only")
+	if (*SDPMedia)(nil).AudioNeedsUnusableSRTP() {
+		t.Error("nil SDPMedia should not be reported")
 	}
 	// ParseSDP rejects an audio-less offer, so build one directly.
 	videoOnly := &SDPMedia{MLines: []RemoteMLine{{Media: "video", Proto: []string{"RTP", "SAVP"}, Port: 40000}}}
-	if videoOnly.AudioIsSRTPOnly() {
-		t.Error("an offer with no audio section should not report SRTP-only")
+	if videoOnly.AudioNeedsUnusableSRTP() {
+		t.Error("an offer with no audio section should not be reported")
 	}
 }

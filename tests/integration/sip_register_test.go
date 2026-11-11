@@ -37,6 +37,8 @@ type rawSIPClient struct {
 	// Inbound CANCEL delivery — lets tests assert a CANCEL actually reached
 	// this contact (rather than being misrouted to the AOR host).
 	cancels chan *sip.Request
+	// Inbound BYE delivery.
+	byes chan *sip.Request
 }
 
 type inviteEvent struct {
@@ -84,6 +86,7 @@ func newRawSIPClient(t *testing.T, ua string) *rawSIPClient {
 		port:    port,
 		invites: make(chan inviteEvent, 8),
 		cancels: make(chan *sip.Request, 8),
+		byes:    make(chan *sip.Request, 8),
 	}
 
 	srv.OnInvite(func(req *sip.Request, tx sip.ServerTransaction) {
@@ -123,6 +126,10 @@ func newRawSIPClient(t *testing.T, ua string) *rawSIPClient {
 	srv.OnBye(func(req *sip.Request, tx sip.ServerTransaction) {
 		res := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil)
 		_ = tx.Respond(res)
+		select {
+		case c.byes <- req:
+		default:
+		}
 	})
 	srv.OnCancel(func(req *sip.Request, tx sip.ServerTransaction) {
 		res := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil)

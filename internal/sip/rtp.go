@@ -31,6 +31,7 @@ type RTPSession struct {
 	closeOnce  sync.Once
 	closeErr   error
 	readBuf    []byte // ReadRTPInto's buffer, owned by the single reader
+	crypto     srtpState
 }
 
 // NewRTPSession creates a new RTP session listening on a random UDP port.
@@ -149,13 +150,26 @@ func (s *RTPSession) readInto(pkt *rtp.Packet, buf []byte) error {
 		return err
 	}
 
+	secure := s.Secure()
+
 	// RFC 5761 §4: drop RTCP frames muxed on the RTP port (PT byte in
 	// 192..223 with V=2). Otherwise they unmarshal cleanly as RTP and feed
 	// garbage to the payload decoder.
 	if n >= 2 {
 		pt2 := buf[1]
 		if pt2 >= 192 && pt2 <= 223 {
+			if secure {
+				if err := s.crypto.checkRTCP(buf[:n]); err != nil {
+					return fmt.Errorf("%w: rtcp: %v", ErrSRTP, err)
+				}
+			}
 			return fmt.Errorf("%w: rtcp-on-rtp-port", ErrNotRTP)
+		}
+	}
+
+	if secure {
+		if n, err = s.crypto.unprotect(buf, n); err != nil {
+			return fmt.Errorf("%w: %v", ErrSRTP, err)
 		}
 	}
 
@@ -180,7 +194,15 @@ func (s *RTPSession) WriteRTP(pkt *rtp.Packet) error {
 	if err != nil {
 		return fmt.Errorf("rtp marshal: %w", err)
 	}
-	_, err = s.conn.WriteToUDP(data, addr)
+	return s.send(data, addr)
+}
+
+// send writes one marshalled RTP packet, encrypting it on an SRTP session.
+func (s *RTPSession) send(data []byte, addr *net.UDPAddr) error {
+	if s.Secure() {
+		return s.crypto.protectAndSend(s.conn, data, addr)
+	}
+	_, err := s.conn.WriteToUDP(data, addr)
 	return err
 }
 
@@ -199,8 +221,7 @@ func (s *RTPSession) WriteRTPBuf(pkt *rtp.Packet, buf []byte) ([]byte, error) {
 	if _, err := pkt.MarshalTo(buf); err != nil {
 		return buf, fmt.Errorf("rtp marshal: %w", err)
 	}
-	_, err := s.conn.WriteToUDP(buf, addr)
-	return buf, err
+	return buf, s.send(buf, addr)
 }
 
 // SendKeepalive sends a small burst of silence RTP packets to the remote
@@ -235,7 +256,7 @@ func (s *RTPSession) SendKeepalive(payloadType uint8, count int) {
 		if err != nil {
 			return
 		}
-		s.conn.WriteToUDP(data, addr)
+		s.send(data, addr)
 		seq++
 		ts += 160
 	}

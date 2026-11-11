@@ -1132,8 +1132,9 @@ func (l *SIPLeg) readLoop(s *mediaStream) {
 				return
 			default:
 			}
-			// Non-RTP packets (RTCP, STUN) fail unmarshal — skip them.
-			if errors.Is(err, sipmod.ErrNotRTP) {
+			// Non-RTP packets (RTCP, STUN) fail unmarshal — skip them. So is a
+			// packet SRTP rejects, which does not count as media either.
+			if errors.Is(err, sipmod.ErrNotRTP) || errors.Is(err, sipmod.ErrSRTP) {
 				continue
 			}
 			// Check for read deadline timeout (no RTP received).
@@ -1745,7 +1746,7 @@ func (l *SIPLeg) ApplyRemoteOffer(body []byte) (answer []byte, direction string)
 	}
 
 	direction = remote.Direction
-	l.applyRemoteAudio(remote)
+	l.applyRemoteAudio(remote, false)
 
 	// Re-plan the whole offer rather than just echoing a direction: a re-offer
 	// may add or remove sections, and RFC 3264 §6 requires the answer to match
@@ -1793,13 +1794,32 @@ func (l *SIPLeg) applyAnswer(body []byte) {
 		l.log.Warn("re-INVITE answer: parse SDP failed", "leg_id", l.id, "error", err)
 		return
 	}
-	l.applyRemoteAudio(remote)
+	l.applyRemoteAudio(remote, true)
+}
+
+// RefusesOffer reports whether a peer's re-offer must be refused with 488: the
+// leg's audio is on SRTP and the offer would take it to plain RTP, or to keys
+// this server cannot use.
+func (l *SIPLeg) RefusesOffer(body []byte) bool {
+	if !l.srtpActive() {
+		return false
+	}
+	remote, err := sipmod.ParseSDP(body)
+	if err != nil {
+		return false
+	}
+	ra := l.matchRemoteStream(l.prim, remote)
+	return ra != nil && ra.RemotePort != 0 && len(ra.Crypto) == 0
 }
 
 // applyRemoteAudio re-points each live stream at the address the peer's latest
 // offer advertises. Streams are matched by a=mid when both sides carry one and
 // positionally otherwise, per RFC 3264 §8.
-func (l *SIPLeg) applyRemoteAudio(remote *sipmod.SDPMedia) {
+//
+// answer is set when remote answers an offer of ours. An SRTP stream then takes
+// the answer's key; an answer without one leaves the stream on the keys and
+// address it had, so it never falls back to plain RTP.
+func (l *SIPLeg) applyRemoteAudio(remote *sipmod.SDPMedia, answer bool) {
 	for _, s := range l.audioStreams() {
 		ra := l.matchRemoteStream(s, remote)
 		if ra == nil || ra.RemotePort == 0 || ra.RemoteIP == "" {
@@ -1807,6 +1827,13 @@ func (l *SIPLeg) applyRemoteAudio(remote *sipmod.SDPMedia) {
 		}
 		if s.rtpSess == nil {
 			continue
+		}
+		if answer && s.rtpSess.Secure() {
+			if err := s.rtpSess.AcceptSRTPAnswer(ra.Crypto); err != nil {
+				l.log.Error("re-INVITE answer is not SRTP; keeping the current keys",
+					"leg_id", l.id, "stream_id", s.id, "error", err)
+				continue
+			}
 		}
 		if err := s.rtpSess.SetRemote(ra.RemoteIP, ra.RemotePort); err != nil {
 			l.log.Warn("re-offer: set remote failed",
@@ -1867,6 +1894,7 @@ func (l *SIPLeg) sdpConfig() sipmod.SDPConfig {
 		DTMFPT:            l.prim.dtmfSendPT,
 		DTMFClockRate:     l.prim.dtmfClockRate,
 		OmitRTCPMux:       l.prim.omitRTCPMux,
+		Crypto:            l.prim.rtpSess.LocalCrypto(),
 	}
 	if l.textRtpSess != nil {
 		cfg.TextRTPPort = l.textRtpSess.LocalPort()

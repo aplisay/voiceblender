@@ -46,6 +46,10 @@ type AudioStream struct {
 	AMRWBModeSet      string
 	AMRNBOctetAligned bool
 	AMRNBModeSet      string
+
+	// Crypto is the a=crypto value (RFC 4568) for the section. Non-empty puts
+	// the section on RTP/SAVP.
+	Crypto string
 }
 
 // PayloadType returns the payload type to advertise for c, preferring an
@@ -86,6 +90,12 @@ type RemoteAudioStream struct {
 	CodecRates   map[codec.CodecType]int
 	CodecFmtp    map[codec.CodecType]string
 	DTMFEventPTs map[uint8]int
+
+	// SRTP is set when the section is on an SRTP profile. Crypto holds its
+	// usable a=crypto lines in the peer's order, and is filled only for
+	// RTP/SAVP; a section with SRTP set and no Crypto cannot be carried.
+	SRTP   bool
+	Crypto []CryptoAttr
 }
 
 // EffectiveDirection resolves an absent direction attribute to the RFC 8866
@@ -186,21 +196,23 @@ func HoldDirection(desired string, held bool) string {
 	}
 }
 
-// AudioIsSRTPOnly reports whether every active audio section the offer carries
-// is on an SRTP profile. Nothing in the RTP media path decrypts SRTP, so such
-// an offer has no section we can play; an offer with at least one plain-RTP
-// audio section, or with no audio at all, is not reported.
-func (m *SDPMedia) AudioIsSRTPOnly() bool {
+// AudioNeedsUnusableSRTP reports whether every active audio section the offer
+// carries needs SRTP this server cannot provide: a DTLS-SRTP profile, or
+// RTP/SAVP with no supported a=crypto line. Such an offer has no section we can
+// play; an offer with at least one usable audio section, or with no audio at
+// all, is not reported.
+func (m *SDPMedia) AudioNeedsUnusableSRTP() bool {
 	if m == nil {
 		return false
 	}
 	active := 0
-	for _, ml := range m.MLines {
-		if ml.Media != "audio" || ml.Port == 0 {
+	for i := range m.Audio {
+		ra := &m.Audio[i]
+		if ra.RemotePort == 0 {
 			continue
 		}
 		active++
-		if !protoIsSRTP(ml.Proto) {
+		if !ra.SRTP || len(ra.Crypto) > 0 {
 			return false
 		}
 	}
@@ -217,4 +229,10 @@ func protoIsSRTP(proto []string) bool {
 		}
 	}
 	return false
+}
+
+// protoIsSDES reports whether an m= transport profile is RTP/SAVP, the one
+// profile SDES keys (RFC 4568) are negotiated on here.
+func protoIsSDES(proto []string) bool {
+	return len(proto) == 2 && strings.EqualFold(proto[0], "RTP") && strings.EqualFold(proto[1], "SAVP")
 }

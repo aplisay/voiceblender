@@ -22,6 +22,12 @@ type AnswerOptions struct {
 	// no cap; DirRecvOnly makes the answer receive-only whatever was offered,
 	// which is what a recording session (RFC 7866) needs.
 	MaxDirection string
+
+	// RequireSRTP refuses every audio section that is not on SRTP. Set once a
+	// leg carries SRTP, so a re-offer cannot take it back to plain RTP. An
+	// offer whose first accepted audio section is SRTP is held to the same
+	// rule for the sections after it.
+	RequireSRTP bool
 }
 
 // SlotAction is what an answer does with one offered m= section.
@@ -74,6 +80,7 @@ func PlanAnswer(offer *SDPMedia, opts AnswerOptions) []SlotPlan {
 	}
 	plans := make([]SlotPlan, 0, len(offer.MLines))
 	accepted := 0
+	requireSRTP := opts.RequireSRTP
 
 	for _, ml := range offer.MLines {
 		p := SlotPlan{
@@ -110,6 +117,12 @@ func PlanAnswer(offer *SDPMedia, opts AnswerOptions) []SlotPlan {
 			// The peer already disabled this section; echo the rejection.
 			p.Action = SlotReject
 			p.Reason = "offer_disabled"
+		case ra.SRTP && len(ra.Crypto) == 0:
+			p.Action = SlotReject
+			p.Reason = "unsupported_srtp"
+		case !ra.SRTP && requireSRTP:
+			p.Action = SlotReject
+			p.Reason = "srtp_required"
 		default:
 			preferred := codec.CodecUnknown
 			if accepted == 0 {
@@ -125,6 +138,9 @@ func PlanAnswer(offer *SDPMedia, opts AnswerOptions) []SlotPlan {
 			p.Codec = selected
 			p.PT = pt
 			p.Direction = NarrowDirection(MirrorDirection(ra.EffectiveDirection()), opts.MaxDirection)
+			if accepted == 0 && ra.SRTP {
+				requireSRTP = true
+			}
 			accepted++
 		}
 

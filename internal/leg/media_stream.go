@@ -1,6 +1,7 @@
 package leg
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -384,7 +385,16 @@ func (l *SIPLeg) answerOptions(preferred codec.CodecType, textMLine int) sipmod.
 		TextMLineIndex:  textMLine,
 		StrictMLines:    l.strictMLines,
 		MaxDirection:    l.maxAnswerDirection,
+		RequireSRTP:     l.srtpActive(),
 	}
+}
+
+// srtpActive reports whether the leg's audio is on SRTP. From then on every
+// offer and answer on the dialog must keep it there.
+func (l *SIPLeg) srtpActive() bool {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.prim.rtpSess != nil && l.prim.rtpSess.Secure()
 }
 
 // buildAnswerStreams materializes an answer plan: it allocates an RTP session
@@ -440,8 +450,21 @@ func (l *SIPLeg) materializeStream(offer *sipmod.SDPMedia, p sipmod.SlotPlan) (*
 		}
 		s.rtpSess = sess
 	}
-	if err := s.rtpSess.SetRemote(ra.RemoteIP, ra.RemotePort); err != nil {
-		l.log.Warn("answer: set remote failed, rejecting section",
+	var (
+		crypto string
+		err    error
+	)
+	switch {
+	case ra.SRTP:
+		crypto, err = s.rtpSess.AnswerSRTP(ra.Crypto)
+	case s.rtpSess.Secure():
+		err = errors.New("plain RTP offered on an SRTP stream")
+	}
+	if err == nil {
+		err = s.rtpSess.SetRemote(ra.RemoteIP, ra.RemotePort)
+	}
+	if err != nil {
+		l.log.Warn("answer: media setup failed, rejecting section",
 			"leg_id", l.id, "m_line", p.Index, "error", err)
 		if !s.primary {
 			s.close()
@@ -479,6 +502,7 @@ func (l *SIPLeg) materializeStream(offer *sipmod.SDPMedia, p sipmod.SlotPlan) (*
 		Label:             s.label,
 		Content:           s.content,
 		Lang:              s.lang,
+		Crypto:            crypto,
 	}, true
 }
 
@@ -596,6 +620,15 @@ func (l *SIPLeg) adoptOutboundStreams(call *sipmod.OutboundCall) bool {
 			sess.Close()
 			l.recordOfferedSlot(i, os, "", sipmod.SlotTombstone)
 			continue
+		}
+		if sess.Secure() {
+			if err := sess.AcceptSRTPAnswer(ra.Crypto); err != nil {
+				l.log.Warn("peer answered an SRTP stream without SRTP; closing it",
+					"leg_id", l.id, "m_line", i, "error", err)
+				sess.Close()
+				l.recordOfferedSlot(i, os, "", sipmod.SlotTombstone)
+				continue
+			}
 		}
 		if err := sess.SetRemote(ra.RemoteIP, ra.RemotePort); err != nil {
 			sess.Close()

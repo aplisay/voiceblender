@@ -50,6 +50,14 @@ func (e *Engine) inviteFork(ctx context.Context, recipient sip.Uri, opts InviteO
 	if len(opts.Codecs) > 0 {
 		codecs = opts.Codecs
 	}
+	// Every branch offers the same key: one socket carries whichever wins.
+	var crypto string
+	if opts.SRTP {
+		if crypto, err = rtpSess.OfferSRTP(); err != nil {
+			rtpSess.Close()
+			return nil, err
+		}
+	}
 	// Branches can sit on different networks, so each gets its own
 	// advertised address in Contact and SDP.
 	branchIP := func(target ForkTarget) (string, bool) {
@@ -86,6 +94,7 @@ func (e *Engine) inviteFork(ctx context.Context, recipient sip.Uri, opts InviteO
 			RTPPort:           rtpSess.LocalPort(),
 			Codecs:            codecs,
 			AMRWBOctetAligned: e.amrwbOctetAligned,
+			Crypto:            crypto,
 		}))
 		req.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
 		req.AppendHeader(e.AllowHeader())
@@ -150,6 +159,10 @@ func (e *Engine) inviteFork(ctx context.Context, recipient sip.Uri, opts InviteO
 						remoteSDP, perr := ParseSDPMessage(res)
 						if perr != nil {
 							e.log.Warn("fork early media: parse 183 SDP", "error", perr)
+							return
+						}
+						if serr := acceptSRTPAnswer(rtpSess, remoteSDP); serr != nil {
+							e.log.Warn("fork early media: ignored", "error", serr)
 							return
 						}
 						if serr := rtpSess.SetRemote(remoteSDP.RemoteIP, remoteSDP.RemotePort); serr != nil {
@@ -236,6 +249,11 @@ func (e *Engine) inviteFork(ctx context.Context, recipient sip.Uri, opts InviteO
 		ds.Bye(context.Background())
 		rtpSess.Close()
 		return nil, fmt.Errorf("parse answer SDP: %w", err)
+	}
+	if err := acceptSRTPAnswer(rtpSess, remoteSDP); err != nil {
+		ds.Bye(context.Background())
+		rtpSess.Close()
+		return nil, err
 	}
 	if err := rtpSess.SetRemote(remoteSDP.RemoteIP, remoteSDP.RemotePort); err != nil {
 		ds.Bye(context.Background())

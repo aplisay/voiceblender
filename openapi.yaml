@@ -4249,6 +4249,11 @@ components:
                     type: boolean
                     description: 'For sip legs: offer Real-Time Text (ITU-T T.140 over RTP per RFC 4103) alongside audio. For websocket legs: enable the bidirectional text-message channel. Default: false.'
                     default: false
+                srtp:
+                    type: string
+                    description: 'SIP legs only. `required` offers the call''s audio as SRTP with SDES keys (RTP/SAVP with a=crypto, RFC 4568). The call fails with reason not_acceptable when the far end refuses the offer or answers without SRTP; it never falls back to plain RTP. Omit the field for plain RTP. Cannot be combined with `rtt`. Inbound calls need no setting: an RTP/SAVP offer is answered with SRTP.'
+                    enum:
+                        - required
                 custom_data:
                     description: Opaque application JSON attached to the leg. Any JSON value is accepted (object, array, string, number, boolean). It is echoed on the leg view and carried at the top level of every event published for this leg, so external state can be correlated without keeping a leg_id lookup table. Capped by CUSTOM_DATA_MAX_BYTES (default 1024 bytes, 0 = unlimited).
                 streams:
@@ -5111,6 +5116,9 @@ components:
                 remote_addr:
                     type: string
                     description: Remote RTP address media is currently sent to.
+                srtp:
+                    type: boolean
+                    description: True when the stream's media is SRTP, keyed by SDES (RFC 4568). Omitted for plain RTP.
                 label:
                     type: string
                     description: The stream's a=label value (RFC 4574), for correlating it with external metadata.

@@ -3,6 +3,7 @@ package sip
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -101,8 +102,8 @@ type Engine struct {
 	onInvite          func(call *InboundCall)
 	onRegisterAttempt func(*RegisterAttempt) RegisterDecision // nil = auto-accept (no inbound REGISTER auth)
 	pendingAuth       *pendingAuthStore
-	onReInvite        func(callID string, body *MessageBody) []byte // returns SDP answer for 200 OK
-	onUpdate          func(callID string, body *MessageBody, hasSDP bool) []byte
+	onReInvite        func(callID string, body *MessageBody) ([]byte, error) // returns SDP answer for 200 OK
+	onUpdate          func(callID string, body *MessageBody, hasSDP bool) ([]byte, error)
 	onRefer           func(callID string, target string, replaces *ReplacesParams, req *sip.Request, tx sip.ServerTransaction)
 	onNotify          func(callID string, statusCode int, reason string, terminated bool)
 	codecs            []codec.CodecType
@@ -585,8 +586,9 @@ func (e *Engine) ChallengeInvite(call *InboundCall, p ChallengeParams) error {
 
 // OnReInvite registers a handler for in-dialog re-INVITE requests (hold/unhold).
 // The handler receives the SIP Call-ID and the SDP direction attribute, and
-// returns the SDP body to include in the 200 OK response (nil = no SDP).
-func (e *Engine) OnReInvite(handler func(callID string, body *MessageBody) []byte) {
+// returns the SDP body to include in the 200 OK response (nil = no SDP). A
+// non-nil error refuses the offer with 488 and leaves the session as it was.
+func (e *Engine) OnReInvite(handler func(callID string, body *MessageBody) ([]byte, error)) {
 	e.onReInvite = handler
 }
 
@@ -596,8 +598,21 @@ func (e *Engine) OnReInvite(handler func(callID string, body *MessageBody) []byt
 // direction is the parsed a=sendrecv/sendonly/recvonly/inactive attribute
 // and the returned []byte is the SDP answer for the 200 OK. When false,
 // direction is "" and the handler should only refresh session-timer state.
-func (e *Engine) OnUpdate(handler func(callID string, body *MessageBody, hasSDP bool) []byte) {
+// A non-nil error refuses the offer with 488.
+func (e *Engine) OnUpdate(handler func(callID string, body *MessageBody, hasSDP bool) ([]byte, error)) {
 	e.onUpdate = handler
+}
+
+// ErrOfferRefused is returned by a re-INVITE or UPDATE handler to refuse the
+// offer with 488 Not Acceptable Here (RFC 3261 §14.2).
+var ErrOfferRefused = errors.New("offer refused")
+
+func (e *Engine) refuseOffer(method string, req *sip.Request, tx sip.ServerTransaction) {
+	res := sip.NewResponseFromRequest(req, sip.StatusNotAcceptableHere, "Not Acceptable Here", nil)
+	res.AppendHeader(e.ServerHeader())
+	if err := e.respondMaybeFromSource(tx, req, res); err != nil {
+		e.log.Error(method+": respond 488 failed", "error", err)
+	}
 }
 
 // OnRefer registers a handler for in-dialog REFER requests (transfer). The
@@ -655,7 +670,12 @@ func (e *Engine) handleReInvite(req *sip.Request, tx sip.ServerTransaction) {
 	// and update hold state.
 	var answerSDP []byte
 	if e.onReInvite != nil {
-		answerSDP = e.onReInvite(callID.Value(), body)
+		var err error
+		if answerSDP, err = e.onReInvite(callID.Value(), body); err != nil {
+			e.log.Info("re-INVITE refused", "call_id", callID.Value(), "error", err)
+			e.refuseOffer("re-INVITE", req, tx)
+			return
+		}
 	}
 
 	// Respond 200 OK with SDP answer (RFC 3261 §14.2 requires SDP in 200).
@@ -751,7 +771,12 @@ func (e *Engine) handleUpdate(req *sip.Request, tx sip.ServerTransaction) {
 
 	var answerSDP []byte
 	if e.onUpdate != nil {
-		answerSDP = e.onUpdate(callID.Value(), body, hasSDP)
+		var err error
+		if answerSDP, err = e.onUpdate(callID.Value(), body, hasSDP); err != nil {
+			e.log.Info("UPDATE refused", "call_id", callID.Value(), "error", err)
+			e.refuseOffer("UPDATE", req, tx)
+			return
+		}
 	}
 
 	res := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", answerSDP)
@@ -1275,6 +1300,11 @@ type InviteOptions struct {
 	RTTEnabled    bool
 	RTTRedundancy int
 
+	// SRTP offers every audio section on RTP/SAVP with SDES keys (RFC 4568)
+	// and fails the call when the answer is not SRTP. There is no fallback to
+	// plain RTP.
+	SRTP bool
+
 	// Streams, when it holds more than one entry, offers that many m=audio
 	// sections. The first is the call's primary bidirectional audio; the rest
 	// are additional streams (e.g. a translated feed). Empty or single-entry
@@ -1331,6 +1361,13 @@ func (e *Engine) buildOfferStreams(cfg *SDPConfig, first *RTPSession, codecs []c
 		as := base
 		as.Codecs = codecs
 		as.Port = sess.LocalPort()
+		if i > 0 && base.Crypto != "" {
+			crypto, err := sess.OfferSRTP()
+			if err != nil {
+				return sessions, nil, fmt.Errorf("stream %d: %w", i, err)
+			}
+			as.Crypto = crypto
+		}
 		as.MID = strconv.Itoa(i)
 		as.Direction = os.Direction
 		as.Lang = os.Lang
@@ -1422,6 +1459,11 @@ func (e *Engine) Invite(ctx context.Context, recipient sip.Uri, opts InviteOptio
 		Codecs:            codecs,
 		AMRWBOctetAligned: e.amrwbOctetAligned,
 		AMRNBOctetAligned: e.amrnbOctetAligned,
+	}
+	if opts.SRTP {
+		if cfg.Crypto, err = rtpSess.OfferSRTP(); err != nil {
+			return nil, err
+		}
 	}
 	extraSess, offered, oerr := e.buildOfferStreams(&cfg, rtpSess, codecs, opts.Streams)
 	if oerr != nil {
@@ -1554,6 +1596,10 @@ func (e *Engine) Invite(ctx context.Context, recipient sip.Uri, opts InviteOptio
 			e.log.Warn("early media: parse 183 SDP failed", "error", err)
 			return nil // non-fatal, keep waiting for 200
 		}
+		if err := acceptSRTPAnswer(rtpSess, remoteSDP); err != nil {
+			e.log.Warn("early media: ignored", "error", err)
+			return nil
+		}
 		if err := rtpSess.SetRemote(remoteSDP.RemoteIP, remoteSDP.RemotePort); err != nil {
 			e.log.Warn("early media: set remote failed", "error", err)
 			return nil
@@ -1585,6 +1631,10 @@ func (e *Engine) Invite(ctx context.Context, recipient sip.Uri, opts InviteOptio
 	remoteSDP, err := ParseSDPMessage(ds.InviteResponse)
 	if err != nil {
 		return nil, fmt.Errorf("parse answer SDP: %w", err)
+	}
+
+	if err := acceptSRTPAnswer(rtpSess, remoteSDP); err != nil {
+		return nil, err
 	}
 
 	// Set remote RTP address
@@ -1642,6 +1692,26 @@ func (e *Engine) Invite(ctx context.Context, recipient sip.Uri, opts InviteOptio
 		SessionTimer:   sessionTimer,
 		LocalIP:        localIP,
 	}, nil
+}
+
+// ErrSRTPRefused is returned by Invite when SRTP was offered and the answer's
+// audio is not SRTP with a usable key. The dialog has been ended with a BYE.
+var ErrSRTPRefused = errors.New("peer did not answer with SRTP")
+
+// acceptSRTPAnswer installs the SDES key from an answer to an SRTP offer. It
+// does nothing for a session that offered plain RTP.
+func acceptSRTPAnswer(sess *RTPSession, answer *SDPMedia) error {
+	if !sess.Secure() {
+		return nil
+	}
+	var offered []CryptoAttr
+	if p := answer.PrimaryStream(); p != nil {
+		offered = p.Crypto
+	}
+	if err := sess.AcceptSRTPAnswer(offered); err != nil {
+		return fmt.Errorf("%w: %v", ErrSRTPRefused, err)
+	}
+	return nil
 }
 
 // Codecs returns the engine's supported codecs.

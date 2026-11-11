@@ -63,6 +63,10 @@ type SDPConfig struct {
 	// AudioStream.OmitRTCPMux.
 	OmitRTCPMux bool
 
+	// Crypto is the a=crypto value for the audio section; see
+	// AudioStream.Crypto.
+	Crypto string
+
 	// Streams, when non-empty, replaces the single audio section the generators
 	// would otherwise derive from RTPPort/Codecs/AMR*/DTMF*. Sections are
 	// emitted in slice order; a zero Port rejects one per RFC 3264 §6. The
@@ -407,6 +411,9 @@ func buildAudioMediaDescription(s AudioStream) *pionsdp.MediaDescription {
 		md.MediaName.Formats = []string{"0"}
 		return md
 	}
+	if s.Crypto != "" {
+		md.MediaName.Protos = []string{"RTP", "SAVP"}
+	}
 
 	dtmfPT := s.DTMFPT
 	if dtmfPT == 0 {
@@ -473,6 +480,9 @@ func buildAudioMediaDescription(s AudioStream) *pionsdp.MediaDescription {
 	if !s.OmitRTCPMux {
 		md.Attributes = append(md.Attributes, pionsdp.NewPropertyAttribute("rtcp-mux"))
 	}
+	if s.Crypto != "" {
+		md.Attributes = append(md.Attributes, pionsdp.NewAttribute("crypto", s.Crypto))
+	}
 
 	return md
 }
@@ -504,6 +514,7 @@ func offerStream(cfg SDPConfig) AudioStream {
 		AMRWBModeSet:      cfg.AMRWBModeSet,
 		AMRNBOctetAligned: cfg.AMRNBOctetAligned,
 		AMRNBModeSet:      cfg.AMRNBModeSet,
+		Crypto:            cfg.Crypto,
 	}
 }
 
@@ -524,6 +535,7 @@ func answerStream(cfg SDPConfig, selected codec.CodecType, selectedPT uint8, dir
 		AMRWBModeSet:      cfg.AMRWBModeSet,
 		AMRNBOctetAligned: cfg.AMRNBOctetAligned,
 		AMRNBModeSet:      cfg.AMRNBModeSet,
+		Crypto:            cfg.Crypto,
 	}
 }
 
@@ -815,6 +827,8 @@ func parseAudioMedia(md *pionsdp.MediaDescription, index int, sessionIP, session
 		m.RemoteIP = md.ConnectionInformation.Address.Address
 		m.AddressFamily = md.ConnectionInformation.AddressType
 	}
+	m.SRTP = protoIsSRTP(md.MediaName.Protos)
+	sdes := protoIsSDES(md.MediaName.Protos)
 
 	rtpmap := make(map[uint8]string)
 	rtpmapRate := make(map[uint8]int)
@@ -861,6 +875,11 @@ func parseAudioMedia(md *pionsdp.MediaDescription, index int, sessionIP, session
 		if a.Key == "ptime" {
 			if v, err := strconv.Atoi(a.Value); err == nil {
 				m.Ptime = v
+			}
+		}
+		if a.Key == "crypto" && sdes {
+			if c, err := ParseCrypto(a.Value); err == nil {
+				m.Crypto = append(m.Crypto, c)
 			}
 		}
 		switch a.Key {
@@ -930,6 +949,10 @@ func parseTextMedia(md *pionsdp.MediaDescription, m *SDPMedia, sd *pionsdp.Sessi
 	port := md.MediaName.Port.Value
 	if port == 0 {
 		// Peer rejecting the text section — leave m.Text nil.
+		return
+	}
+	if protoIsSRTP(md.MediaName.Protos) {
+		// RTT is not carried over SRTP; the section is left to be refused.
 		return
 	}
 	tx := &SDPTextMedia{RemotePort: port}
